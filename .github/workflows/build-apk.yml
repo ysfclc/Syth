@@ -127,9 +127,10 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # Do not use android-actions/setup-android here.
-      # It attempts to install the obsolete SDK package "tools".
-      - name: Configure preinstalled Android SDK
+      # Use the runner's preinstalled SDK. Do not use
+      # android-actions/setup-android@v3 because it tries
+      # to install the obsolete SDK package named "tools".
+      - name: Configure Android SDK
         if: steps.prebuilt.outputs.found != 'true'
         id: android
         shell: bash
@@ -139,7 +140,7 @@ jobs:
           sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
 
           if [[ ! -d "$sdk" ]]; then
-            echo "::error::Android SDK directory not found: $sdk"
+            echo "::error::Android SDK not found: $sdk"
             exit 1
           fi
 
@@ -153,17 +154,15 @@ jobs:
 
           if [[ -z "$manager" || ! -x "$manager" ]]; then
             echo "::error::Could not locate sdkmanager."
-            find "$sdk/cmdline-tools" -maxdepth 4 -type f \
-              -name sdkmanager -print 2>/dev/null || true
             exit 1
           fi
 
           echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
           echo "$sdk/platform-tools" >> "$GITHUB_PATH"
-
           echo "sdkmanager=$manager" >> "$GITHUB_OUTPUT"
-          echo "Using SDK: $sdk"
+
+          echo "Using Android SDK: $sdk"
           echo "Using sdkmanager: $manager"
 
       - name: Install Android SDK packages
@@ -260,8 +259,6 @@ jobs:
           cp "$apk" "$RUNNER_TEMP/synthos-output/app-release.apk"
           echo "APK produced: $apk"
 
-      # An unsigned release APK cannot be installed.
-      # Sign it with a temporary CI key if necessary.
       - name: Sign and verify APK
         id: apk
         shell: bash
@@ -283,7 +280,7 @@ jobs:
           fi
 
           if ! "$signer" verify "$apk" >/dev/null 2>&1; then
-            echo "APK is unsigned or its signature is invalid; signing for testing."
+            echo "Signing APK with a temporary CI key for testing."
 
             keystore="$RUNNER_TEMP/synthos-ci.keystore"
 
