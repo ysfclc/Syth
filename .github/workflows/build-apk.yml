@@ -1,16 +1,19 @@
+
 name: Build SynthOS APK
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     tags:
       - 'v*.*.*'
   pull_request:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       archive_path:
-        description: 'Path to app ZIP (default: app-release.zip; searched by basename if not at that path)'
+        description: 'Path to app ZIP'
         required: false
         default: 'app-release.zip'
         type: string
@@ -20,78 +23,100 @@ permissions:
 
 jobs:
   build:
-    name: Extract and build Android APK
+    name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
+
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Locate app ZIP
         id: archive
         shell: bash
         env:
-          REQUESTED_ARCHIVE: ${{ github.event.inputs.archive_path || 'app-release.zip' }}
+          REQUESTED_ARCHIVE: ${{ inputs.archive_path || 'app-release.zip' }}
         run: |
           set -euo pipefail
+
           requested="$REQUESTED_ARCHIVE"
+
           if [[ -f "$requested" ]]; then
-            candidate="$requested"
+            archive="$requested"
           else
-            base="$(basename "$requested")"
-            candidate="$(find . -maxdepth 7 -type f -name "$base" -not -path './.git/*' -print -quit || true)"
+            archive="$(find . -maxdepth 7 \
+              -type f \
+              -name "$(basename "$requested")" \
+              -not -path './.git/*' \
+              -print -quit || true)"
           fi
-          if [[ -z "${candidate:-}" || ! -f "$candidate" ]]; then
-            echo "ERROR: Could not locate app ZIP '$requested'. Commit app-release.zip to the repository root or set workflow_dispatch input archive_path." >&2
+
+          if [[ -z "${archive:-}" || ! -f "$archive" ]]; then
+            echo "::error::Cannot find app ZIP: $requested"
             exit 1
           fi
-          echo "Using app archive: $candidate"
-          echo "path=$candidate" >> "$GITHUB_OUTPUT"
 
-      - name: Safely extract ZIP
+          echo "path=$archive" >> "$GITHUB_OUTPUT"
+          echo "Found: $archive"
+
+      - name: Extract app ZIP safely
         id: extract
         shell: bash
         env:
           ARCHIVE: ${{ steps.archive.outputs.path }}
         run: |
           set -euo pipefail
+
           destination="$RUNNER_TEMP/synthos-unpacked"
           mkdir -p "$destination"
+
           python3 - "$ARCHIVE" "$destination" <<'PY'
-          import pathlib, sys, zipfile
+          import pathlib
+          import sys
+          import zipfile
+
           archive = pathlib.Path(sys.argv[1])
           root = pathlib.Path(sys.argv[2]).resolve()
-          with zipfile.ZipFile(archive) as zf:
-              for info in zf.infolist():
-                  target = (root / info.filename).resolve()
+
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  target = (root / item.filename).resolve()
                   if target != root and root not in target.parents:
-                      raise SystemExit(f"Unsafe ZIP path rejected: {info.filename}")
-              zf.extractall(root)
-          print(f"Extracted {archive} into {root}")
+                      raise SystemExit(
+                          f"Unsafe archive path: {item.filename}"
+                      )
+              z.extractall(root)
+
+          print(f"Extracted into {root}")
           PY
+
           echo "dir=$destination" >> "$GITHUB_OUTPUT"
 
-      - name: Prefer a prebuilt APK if present
+      - name: Locate prebuilt APK
         id: prebuilt
         shell: bash
         env:
           EXTRACT_DIR: ${{ steps.extract.outputs.dir }}
         run: |
           set -euo pipefail
-          apk=""
-          if [[ -f "$EXTRACT_DIR/apk/app-release.apk" ]]; then
-            apk="$EXTRACT_DIR/apk/app-release.apk"
-          else
-            apk="$(find "$EXTRACT_DIR" -maxdepth 8 -type f -iname '*.apk' -print -quit || true)"
+
+          apk="$EXTRACT_DIR/apk/app-release.apk"
+
+          if [[ ! -f "$apk" ]]; then
+            apk="$(find "$EXTRACT_DIR" \
+              -maxdepth 8 -type f -name '*.apk' \
+              -print -quit || true)"
           fi
+
+          mkdir -p "$RUNNER_TEMP/synthos-output"
+
           if [[ -n "$apk" && -f "$apk" ]]; then
-            mkdir -p "$RUNNER_TEMP/synthos-output"
             cp "$apk" "$RUNNER_TEMP/synthos-output/app-release.apk"
             echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "Using prebuilt APK: $apk"
+            echo "Using prebuilt APK."
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No prebuilt APK found; checking for buildable Android source."
+            echo "No prebuilt APK found; building from source."
           fi
 
       - name: Set up JDK 17
@@ -100,20 +125,30 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
       - name: Set up Android SDK
         if: steps.prebuilt.outputs.found != 'true'
         uses: android-actions/setup-android@v3
+        with:
+          log-accepted-android-sdk-licenses: false
 
-      - name: Install Android SDK components
+      - name: Install Android SDK packages
         if: steps.prebuilt.outputs.found != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
 
-      - name: Find Android source tree
+          sdkmanager --version
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0'
+
+      - name: Locate Android source
         if: steps.prebuilt.outputs.found != 'true'
         id: source
         shell: bash
@@ -121,23 +156,37 @@ jobs:
           EXTRACT_DIR: ${{ steps.extract.outputs.dir }}
         run: |
           set -euo pipefail
-          src="$EXTRACT_DIR/source"
-          if [[ ! -f "$src/settings.gradle" && ! -f "$src/settings.gradle.kts" ]]; then
-            candidate="$(find "$EXTRACT_DIR" -maxdepth 6 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit || true)"
-            if [[ -n "$candidate" ]]; then src="$(dirname "$candidate")"; fi
-          fi
-          if [[ ! -f "$src/settings.gradle" && ! -f "$src/settings.gradle.kts" ]]; then
-            echo "ERROR: No prebuilt APK and no Gradle Android source (settings.gradle[.kts]) were found in the ZIP." >&2
-            exit 1
-          fi
-          if [[ ! -f "$src/app/build.gradle" && ! -f "$src/app/build.gradle.kts" ]]; then
-            echo "ERROR: Android project found at '$src' but app/build.gradle[.kts] is missing." >&2
-            exit 1
-          fi
-          echo "dir=$src" >> "$GITHUB_OUTPUT"
-          echo "Android source: $src"
 
-      - name: Build installable release APK from source
+          src="$EXTRACT_DIR/source"
+
+          if [[ ! -f "$src/settings.gradle" &&
+                ! -f "$src/settings.gradle.kts" ]]; then
+            settings="$(find "$EXTRACT_DIR" \
+              -maxdepth 7 -type f \
+              \( -name settings.gradle \
+                 -o -name settings.gradle.kts \) \
+              -print -quit || true)"
+
+            if [[ -n "$settings" ]]; then
+              src="$(dirname "$settings")"
+            fi
+          fi
+
+          if [[ ! -f "$src/settings.gradle" &&
+                ! -f "$src/settings.gradle.kts" ]]; then
+            echo "::error::No Gradle settings file found."
+            exit 1
+          fi
+
+          if [[ ! -f "$src/app/build.gradle" &&
+                ! -f "$src/app/build.gradle.kts" ]]; then
+            echo "::error::Android app Gradle file is missing."
+            exit 1
+          fi
+
+          echo "dir=$src" >> "$GITHUB_OUTPUT"
+
+      - name: Build release APK
         if: steps.prebuilt.outputs.found != 'true'
         shell: bash
         env:
@@ -145,32 +194,53 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR"
-          if [[ -x ./gradlew ]]; then
-            ./gradlew --no-daemon --stacktrace clean assembleRelease
-          elif command -v gradle >/dev/null 2>&1; then
-            gradle --no-daemon --stacktrace clean assembleRelease
-          else
-            echo 'ERROR: Gradle wrapper/bootstrap or installed Gradle is missing.' >&2
-            exit 1
-          fi
-          apk="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' ! -name '*unsigned*' -print -quit || true)"
-          if [[ -z "$apk" || ! -f "$apk" ]]; then
-            echo 'ERROR: Gradle completed but no signed release APK was produced.' >&2
-            find app/build/outputs -maxdepth 6 -type f -print || true
-            exit 1
-          fi
-          mkdir -p "$RUNNER_TEMP/synthos-output"
-          cp "$apk" "$RUNNER_TEMP/synthos-output/app-release.apk"
-          echo "Built APK: $apk"
 
-      - name: Verify APK artifact
+          if [[ -x ./gradlew ]]; then
+            ./gradlew --no-daemon clean assembleRelease
+          elif command -v gradle >/dev/null 2>&1; then
+            gradle --no-daemon clean assembleRelease
+          else
+            echo "::error::Gradle wrapper or Gradle executable is missing."
+            exit 1
+          fi
+
+          apk="$(find app/build/outputs/apk/release \
+            -maxdepth 1 -type f -name '*.apk' \
+            -print -quit || true)"
+
+          if [[ -z "$apk" || ! -f "$apk" ]]; then
+            echo "::error::Build completed without producing a release APK."
+            find app/build/outputs -type f -print || true
+            exit 1
+          fi
+
+          cp "$apk" "$RUNNER_TEMP/synthos-output/app-release.apk"
+
+      - name: Verify APK
         id: apk
         shell: bash
         run: |
           set -euo pipefail
+
           apk="$RUNNER_TEMP/synthos-output/app-release.apk"
-          [[ -s "$apk" ]] || { echo 'ERROR: Final APK is absent or empty.' >&2; exit 1; }
-          file "$apk"
+
+          if [[ ! -s "$apk" ]]; then
+            echo "::error::APK is missing or empty."
+            exit 1
+          fi
+
+          if ! command -v apksigner >/dev/null 2>&1; then
+            apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          else
+            apksigner="$(command -v apksigner)"
+          fi
+
+          if [[ -x "$apksigner" ]]; then
+            "$apksigner" verify "$apk"
+          else
+            echo "::warning::apksigner unavailable; signature not verified."
+          fi
+
           sha256sum "$apk"
           echo "path=$apk" >> "$GITHUB_OUTPUT"
 
@@ -182,9 +252,10 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish GitHub Release for version tag
+      - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.apk.outputs.path }}
           generate_release_notes: true
+          
