@@ -53,7 +53,6 @@ jobs:
 
           if [[ -z "${archive:-}" || ! -f "$archive" ]]; then
             echo "::error::Cannot find app ZIP: $requested"
-            echo "Repository files:"
             find . -maxdepth 4 -type f -print | head -200
             exit 1
           fi
@@ -106,9 +105,7 @@ jobs:
 
           if [[ ! -f "$apk" ]]; then
             apk="$(find "$EXTRACT_DIR" \
-              -maxdepth 8 \
-              -type f \
-              -name '*.apk' \
+              -maxdepth 8 -type f -name '*.apk' \
               -print -quit || true)"
           fi
 
@@ -130,23 +127,61 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
+      # Do not use android-actions/setup-android here.
+      # It attempts to install the obsolete SDK package "tools".
+      - name: Configure preinstalled Android SDK
         if: steps.prebuilt.outputs.found != 'true'
-        uses: android-actions/setup-android@v3
-        with:
-          log-accepted-android-sdk-licenses: false
-
-      - name: Install Android SDK packages
-        if: steps.prebuilt.outputs.found != 'true'
+        id: android
         shell: bash
         run: |
           set -euo pipefail
 
-          sdkmanager --version
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
 
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          if [[ ! -d "$sdk" ]]; then
+            echo "::error::Android SDK directory not found: $sdk"
+            exit 1
+          fi
 
-          sdkmanager \
+          if [[ -x "$sdk/cmdline-tools/latest/bin/sdkmanager" ]]; then
+            manager="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          else
+            manager="$(find "$sdk/cmdline-tools" \
+              -type f -name sdkmanager -print 2>/dev/null \
+              | sort -V | tail -n 1 || true)"
+          fi
+
+          if [[ -z "$manager" || ! -x "$manager" ]]; then
+            echo "::error::Could not locate sdkmanager."
+            find "$sdk/cmdline-tools" -maxdepth 4 -type f \
+              -name sdkmanager -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+          echo "$sdk/platform-tools" >> "$GITHUB_PATH"
+
+          echo "sdkmanager=$manager" >> "$GITHUB_OUTPUT"
+          echo "Using SDK: $sdk"
+          echo "Using sdkmanager: $manager"
+
+      - name: Install Android SDK packages
+        if: steps.prebuilt.outputs.found != 'true'
+        shell: bash
+        env:
+          SDKMANAGER: ${{ steps.android.outputs.sdkmanager }}
+        run: |
+          set -euo pipefail
+
+          "$SDKMANAGER" --version
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" \
+            --licenses >/dev/null 2>&1 || true
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" \
             'platform-tools' \
             'platforms;android-35' \
             'build-tools;35.0.0'
@@ -165,8 +200,7 @@ jobs:
           if [[ ! -f "$src/settings.gradle" &&
                 ! -f "$src/settings.gradle.kts" ]]; then
             settings="$(find "$EXTRACT_DIR" \
-              -maxdepth 7 \
-              -type f \
+              -maxdepth 7 -type f \
               \( -name settings.gradle \
                  -o -name settings.gradle.kts \) \
               -print -quit || true)"
@@ -214,22 +248,21 @@ jobs:
           fi
 
           apk="$(find app/build/outputs/apk/release \
-            -maxdepth 1 \
-            -type f \
-            -name '*.apk' \
+            -maxdepth 1 -type f -name '*.apk' \
             -print -quit || true)"
 
           if [[ -z "$apk" || ! -f "$apk" ]]; then
             echo "::error::No release APK was produced."
-            echo "APK output files:"
             find app/build/outputs -type f -print || true
             exit 1
           fi
 
           cp "$apk" "$RUNNER_TEMP/synthos-output/app-release.apk"
-          echo "Built APK: $apk"
+          echo "APK produced: $apk"
 
-      - name: Verify APK
+      # An unsigned release APK cannot be installed.
+      # Sign it with a temporary CI key if necessary.
+      - name: Sign and verify APK
         id: apk
         shell: bash
         run: |
@@ -242,16 +275,37 @@ jobs:
             exit 1
           fi
 
-          apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          signer="$ANDROID_HOME/build-tools/35.0.0/apksigner"
 
-          if [[ -x "$apksigner" ]]; then
-            "$apksigner" verify "$apk" || {
-              echo "::error::APK signature verification failed."
-              exit 1
-            }
-          else
-            echo "::warning::apksigner unavailable; signature not verified."
+          if [[ ! -x "$signer" ]]; then
+            echo "::error::apksigner was not found."
+            exit 1
           fi
+
+          if ! "$signer" verify "$apk" >/dev/null 2>&1; then
+            echo "APK is unsigned or its signature is invalid; signing for testing."
+
+            keystore="$RUNNER_TEMP/synthos-ci.keystore"
+
+            keytool -genkeypair \
+              -keystore "$keystore" \
+              -storepass android \
+              -alias synthos-ci \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=SynthOS CI,O=SynthOS,C=PL"
+
+            "$signer" sign \
+              --ks "$keystore" \
+              --ks-key-alias synthos-ci \
+              --ks-pass pass:android \
+              --key-pass pass:android \
+              "$apk"
+          fi
+
+          "$signer" verify "$apk"
 
           echo "APK size:"
           du -h "$apk"
